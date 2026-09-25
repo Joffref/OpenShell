@@ -604,9 +604,13 @@ addresses whose TTL is at most 30 seconds. This applies to every endpoint, not
 only `protocol: tcp`. The sandbox applies no DNS search domains, so request each
 hostname exactly as your rules name it. Clients must resolve the hostname again
 before reconnecting. A client that caches an address indefinitely can fail
-after it expires, even while the endpoint remains allowed. OpenShell returns an
-empty answer to AAAA queries, so dual-stack clients must fall back to the A
-record.
+after it expires, even while the endpoint remains allowed. By default,
+OpenShell returns an empty answer to AAAA queries, so dual-stack clients must
+fall back to the A record. When the supervisor host has an IPv6 default route
+and no IPv4 default route, such as an IPv6-only host behind NAT64/DNS64,
+OpenShell also answers AAAA queries with placeholder IPv6 addresses. Compute
+drivers can force either behavior with the supervisor flag
+`--policy-dns-ipv6-egress=enabled` or `--policy-dns-ipv6-egress=disabled`.
 
 ## Next Steps
 
