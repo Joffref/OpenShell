@@ -40,6 +40,8 @@ use crate::proxy::ProxyHandle;
 use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_isolation_interface::contract::NetworkMediationSource;
 
+pub use crate::policy_dns::PolicyDnsIpv6Egress;
+
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
     pub listeners: Vec<tokio::net::TcpListener>,
@@ -197,6 +199,7 @@ pub async fn run_networking(
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
+    policy_dns_ipv6_egress: PolicyDnsIpv6Egress,
     proxy_tls_dir: Option<&std::path::Path>,
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
@@ -442,7 +445,8 @@ pub async fn run_networking(
             engine,
             source,
             host_gateway_ip,
-            crate::policy_dns::PolicyDnsRuntimeConfig::for_epoch(0)?,
+            crate::policy_dns::PolicyDnsRuntimeConfig::for_epoch(0)?
+                .with_ipv6_egress(policy_dns_ipv6_egress.resolve()),
             engine_ready_rx.clone(),
         )?)
     } else {

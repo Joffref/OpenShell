@@ -507,6 +507,8 @@ pub async fn run_network_proxy(
         AgentProposals::new(initial_agent_proposals_enabled),
         workspace_rx,
         &upstream_proxy_args,
+        // No isolation boundary is attached, so mediated policy DNS is off.
+        openshell_supervisor_network::run::PolicyDnsIpv6Egress::Disabled,
         Some(&tls_dir.path),
         None,
         #[cfg(target_os = "linux")]
@@ -571,6 +573,7 @@ pub async fn run_sandbox(
     ocsf_enabled: Arc<AtomicBool>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
@@ -890,6 +893,7 @@ pub async fn run_sandbox(
             agent_proposals.clone(),
             workspace_rx.clone(),
             &upstream_proxy_args,
+            policy_dns_ipv6_egress,
             None,
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]

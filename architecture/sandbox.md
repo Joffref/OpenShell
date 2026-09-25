@@ -274,6 +274,14 @@ descriptor-owner snapshot proves who sent an already queued query. Consumers
 must not use this unavailable identity to grant binary-specific access. TCP
 connection authorization still uses decision-time binary identity.
 
+AAAA queries receive NOERROR/NODATA unless IPv6 egress is enabled. The
+driver-owned `--policy-dns-ipv6-egress` flag selects `auto` (default),
+`enabled`, or `disabled`; `auto` enables IPv6 answers only when the
+supervisor network namespace has an IPv6 default route and no IPv4 default
+route, so dual-stack and IPv4-only hosts keep the A-record fallback. IPv6
+answers come from the epoch-scoped synthetic IPv6 pool and are pinned and
+dialed like IPv4 answers.
+
 The sandbox retains only bounded DNS socket-admission records, consumes TCP
 records on accept, and reclaims closed UDP records when capacity is reached.
 The kernel delivers replies from the configured nameserver address, including
