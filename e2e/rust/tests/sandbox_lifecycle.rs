@@ -111,6 +111,257 @@ async fn delete_sandbox(name: &str) {
     let _ = cmd.status().await;
 }
 
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn sandbox_exec_large_output_is_complete() {
+    const BYTES: usize = 8 * 1024 * 1024;
+    let mut sandbox = SandboxGuard::create(&[])
+        .await
+        .expect("create sandbox for large output");
+
+    for stderr in [false, true] {
+        let script = if stderr {
+            format!("yes A | head -c {BYTES} >&2")
+        } else {
+            format!("yes A | head -c {BYTES}")
+        };
+        let mut command = openshell_cmd();
+        command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "sh",
+                "-c",
+                &script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .expect("large exec output timed out")
+            .expect("run large exec output");
+        assert!(output.status.success(), "large exec exited unsuccessfully");
+        let bytes = if stderr { output.stderr } else { output.stdout };
+        assert_eq!(bytes.len(), BYTES, "exec output was truncated");
+        assert!(bytes.chunks_exact(2).all(|pair| pair == b"A\n"));
+    }
+
+    let mut early_exit = openshell_cmd();
+    let mut early_child = early_exit
+        .args([
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox.name,
+            "--no-tty",
+            "--no-login-shell",
+            "--",
+            "head",
+            "-n1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start early-exit exec");
+    let mut input = b"first\n".to_vec();
+    input.extend(vec![b'x'; 128 * 1024]);
+    let write_result = early_child
+        .stdin
+        .take()
+        .expect("early-exit stdin")
+        .write_all(&input)
+        .await;
+    if let Err(error) = write_result {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+    let early_output =
+        tokio::time::timeout(Duration::from_secs(30), early_child.wait_with_output())
+            .await
+            .expect("early-exit exec timed out")
+            .expect("wait for early-exit exec");
+    assert!(early_output.status.success(), "early-exit exec failed");
+    assert_eq!(early_output.stdout, b"first\n");
+
+    let mut command = openshell_cmd();
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "sh",
+                "-c",
+                "sleep 5 & echo ok",
+            ])
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("exec with background pipe holder timed out")
+    .expect("run exec with background pipe holder");
+    assert!(output.status.success(), "unexpected output failure");
+    assert_eq!(output.stdout, b"ok\n");
+
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn piped_exec_stdin_crosses_grpc_message_limit() {
+    let mut sandbox = SandboxGuard::create(&[])
+        .await
+        .expect("create sandbox for streamed stdin");
+
+    for size in [5, 1_048_576, 4_194_304] {
+        let mut command = openshell_cmd();
+        command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "wc",
+                "-c",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn sandbox exec");
+        let mut input = child.stdin.take().expect("piped stdin");
+        input
+            .write_all(&vec![b'x'; size])
+            .await
+            .expect("write piped stdin");
+        drop(input);
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .expect("streamed exec timed out")
+            .expect("wait for streamed exec");
+        assert!(
+            output.status.success(),
+            "streamed exec failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            size.to_string()
+        );
+    }
+
+    let mut oversized = openshell_cmd();
+    let mut oversized_child = oversized
+        .args([
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox.name,
+            "--no-tty",
+            "--no-login-shell",
+            "--",
+            "wc",
+            "-c",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oversized stdin exec");
+    oversized_child
+        .stdin
+        .take()
+        .expect("oversized stdin pipe")
+        .write_all(&vec![b'x'; 4_194_305])
+        .await
+        .expect("write oversized stdin");
+    let oversized_output = oversized_child
+        .wait_with_output()
+        .await
+        .expect("wait for oversized stdin error");
+    assert!(!oversized_output.status.success());
+    assert!(oversized_output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&oversized_output.stderr).contains("4 MiB limit"));
+
+    // A forced PTY with a small pipe must keep using the unary RPC for
+    // compatibility with older gateways.
+    let mut tty_command = openshell_cmd();
+    let mut tty_child = tty_command
+        .args([
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox.name,
+            "--tty",
+            "--no-login-shell",
+            "--",
+            "sh",
+            "-c",
+            "printf tty-ok",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn forced TTY exec");
+    tty_child
+        .stdin
+        .take()
+        .expect("piped TTY stdin")
+        .write_all(b"x")
+        .await
+        .expect("write TTY stdin");
+    let tty_output = tokio::time::timeout(Duration::from_secs(30), tty_child.wait_with_output())
+        .await
+        .expect("forced TTY exec timed out")
+        .expect("wait for forced TTY exec");
+    assert!(
+        tty_output.status.success(),
+        "forced TTY exec failed: {}",
+        String::from_utf8_lossy(&tty_output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&tty_output.stdout).contains("tty-ok"));
+
+    #[cfg(unix)]
+    {
+        let directory = std::fs::File::open("/").expect("open directory as stdin");
+        let mut command = openshell_cmd();
+        let output = command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "wc",
+                "-c",
+            ])
+            .stdin(Stdio::from(directory))
+            .output()
+            .await
+            .expect("run exec with unreadable stdin");
+        assert!(!output.status.success(), "stdin read error was ignored");
+        assert!(output.stdout.is_empty());
+    }
+
+    sandbox.cleanup().await;
+}
+
 async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
     let mut cmd = openshell_cmd();
     cmd.args(["sandbox", operation, name])

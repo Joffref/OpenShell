@@ -10,9 +10,9 @@ mod relay;
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use crate::policy_dns::PolicyEndpointId;
-use crate::policy_dns::{MappingLookupError, ResolvedEndpointStore};
+use crate::policy_dns::{MappingLookup, MappingLookupError, ResolvedEndpointStore};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
@@ -77,8 +77,8 @@ enum ProxyAcceptError {
 }
 
 use self::destination::{
-    DestinationDenial, DestinationDenialKind, DestinationRequest, build_pinned_validation_plan,
-    build_validation_plan, validate_destination,
+    DestinationDenial, DestinationDenialKind, DestinationRequest, DestinationValidationPlan,
+    build_pinned_validation_plan, build_validation_plan, validate_destination,
 };
 use self::egress::{
     EgressDecision, EgressIntent, EndpointDecision, IdentityUnavailableReason, L7ConfigSnapshot,
@@ -435,6 +435,8 @@ impl ProxyHandle {
                                     let cache = identity_cache.clone();
                                     let backend_gateway = *backend_host_gateway;
                                     let trusted_gateway = *trusted_host_gateway;
+                                    let dtx = denial_tx.clone();
+                                    let has_policy_local = policy_local_ctx.is_some();
                                     tokio::spawn(async move {
                                         if let Some(connection) = preauthorize_transparent_open(
                                             connection,
@@ -443,6 +445,8 @@ impl ProxyHandle {
                                             &cache,
                                             backend_gateway,
                                             trusted_gateway,
+                                            has_policy_local,
+                                            dtx.as_ref(),
                                         )
                                         .await
                                         {
@@ -582,6 +586,7 @@ impl ProxyHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn preauthorize_transparent_open(
     connection: PendingTcpOpen,
     policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
@@ -589,6 +594,8 @@ async fn preauthorize_transparent_open(
     identity_cache: &BinaryIdentityCache,
     backend_host_gateway: Option<IpAddr>,
     trusted_host_gateway: Option<IpAddr>,
+    has_policy_local: bool,
+    denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
 ) -> Option<AcceptedProxyConnection> {
     let PendingTcpOpen {
         stream,
@@ -603,20 +610,72 @@ async fn preauthorize_transparent_open(
         timing,
         operation: "tcp",
     };
-    let host = match transparent_destination_host(destination, policy_dns_store, opa_engine) {
-        Ok(host) => host,
-        Err(error) => {
-            warn!(%destination, %error, "Denied staged transparent connection");
+    if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS) {
+        if destination.port() != 80 || !has_policy_local {
             emit_staged_transparent_denial(
                 destination,
+                None,
                 &binary_identity,
-                &error.to_string(),
-                "transparent_tcp_mapping_denied",
+                "sandbox-local policy API requires port 80 and an active context",
+                "transparent_tcp_policy_local_invalid_destination",
             );
             let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
         }
-    };
+        let identity_check = binary_identity
+            .as_ref()
+            .map_err(|_| TcpOpenDenial::IdentityUnavailable)
+            .and_then(|identity| {
+                identity_cache
+                    .verify_or_cache_supplied_identity(identity)
+                    .map_err(|error| match error {
+                        SuppliedIdentityError::Unavailable(_) => TcpOpenDenial::IdentityUnavailable,
+                        SuppliedIdentityError::CapacityExhausted => {
+                            TcpOpenDenial::ResourceExhausted
+                        }
+                    })
+            });
+        if let Err(denial) = identity_check {
+            emit_staged_transparent_denial(
+                destination,
+                None,
+                &binary_identity,
+                "sandbox-local policy API requires a verified workload identity",
+                "transparent_tcp_policy_local_identity_unavailable",
+            );
+            let _ = completion.send(TcpOpenDecision::Denied(denial));
+            return None;
+        }
+        if completion.send(TcpOpenDecision::RelayReady).is_err() {
+            return None;
+        }
+        return Some((
+            stream,
+            Some(binary_identity),
+            None,
+            Some(TransparentOpen {
+                destination,
+                authorization: None,
+            }),
+        ));
+    }
+    let TransparentTarget { host, intent } =
+        match resolve_transparent_target(destination, policy_dns_store, opa_engine) {
+            Ok(target) => target,
+            Err(error) => {
+                warn!(%destination, %error, "Denied staged transparent connection");
+                emit_staged_transparent_denial(
+                    destination,
+                    None,
+                    &binary_identity,
+                    &error.to_string(),
+                    "transparent_tcp_mapping_denied",
+                );
+                let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+                return None;
+            }
+        };
+    let mapped_host = intent.is_some().then_some(host.as_str());
     let supplied_authorization = authorize_supplied_identity_with_denial(
         opa_engine,
         identity_cache,
@@ -639,16 +698,77 @@ async fn preauthorize_transparent_open(
             },
         );
         warn!(%destination, %reason, "Denied staged transparent connection");
-        emit_staged_transparent_denial(destination, &binary_identity, reason, status_detail);
+        emit_staged_transparent_denial(
+            destination,
+            mapped_host,
+            &binary_identity,
+            reason,
+            status_detail,
+        );
+        if supplied_authorization.denial.is_none()
+            && !is_always_blocked_ip(destination.ip())
+            && let Some(binary) = decision.binary.as_ref()
+        {
+            emit_denial_simple(
+                denial_tx,
+                &host,
+                destination.port(),
+                &binary.to_string_lossy(),
+                &decision,
+                reason,
+                "transparent_tcp_connect",
+            );
+        }
         let _ = completion.send(TcpOpenDecision::Denied(denial));
         return None;
     }
+    // A synthetic destination may dial only the addresses pinned for the
+    // generation that produced this decision. Re-acquiring the mapping at that
+    // generation keeps a policy reload between correlation and authorization
+    // from falling back to resolving the name again. Observation records pin
+    // no addresses, so they never reach an upstream dial.
+    let pinned_plan = match &intent {
+        None => None,
+        Some(intent) => match policy_dns_store
+            .ok_or(MappingLookupError::Missing)
+            .and_then(|store| pinned_transparent_plan(store, destination, &decision))
+        {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                let (reason, status_detail) = match error {
+                    _ if intent.record.is_observation() => (
+                        "unapproved DNS observation cannot authorize egress".to_string(),
+                        "transparent_tcp_observation_denied",
+                    ),
+                    MappingLookupError::InvalidMapping => (
+                        "policy DNS produced an invalid pinned destination".to_string(),
+                        "transparent_tcp_destination_denied",
+                    ),
+                    error => (
+                        format!("transparent destination mapping is unavailable: {error}"),
+                        "transparent_tcp_mapping_denied",
+                    ),
+                };
+                warn!(%destination, %reason, "Denied staged transparent connection");
+                emit_staged_transparent_denial(
+                    destination,
+                    mapped_host,
+                    &binary_identity,
+                    &reason,
+                    status_detail,
+                );
+                let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+                return None;
+            }
+        },
+    };
     if let Err(denial) =
         hydrate_destination_plan(&mut decision, backend_host_gateway, trusted_host_gateway)
     {
         warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
         emit_staged_transparent_denial(
             destination,
+            mapped_host,
             &binary_identity,
             &denial.reason,
             "transparent_tcp_destination_denied",
@@ -656,26 +776,7 @@ async fn preauthorize_transparent_open(
         let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
         return None;
     }
-    if let Some(mapping) = policy_dns_store.and_then(|store| {
-        store
-            .lookup(
-                destination.ip(),
-                destination.port(),
-                opa_engine.current_generation(),
-                std::time::Instant::now(),
-            )
-            .ok()
-    }) {
-        let Ok(plan) = build_pinned_validation_plan(mapping.pinned_addresses()) else {
-            emit_staged_transparent_denial(
-                destination,
-                &binary_identity,
-                "policy DNS produced an invalid pinned destination",
-                "transparent_tcp_destination_denied",
-            );
-            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
-            return None;
-        };
+    if let Some(plan) = pinned_plan {
         decision.endpoint.destination = Some(plan);
     }
     let plan = decision
@@ -696,6 +797,7 @@ async fn preauthorize_transparent_open(
             warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
             emit_staged_transparent_denial(
                 destination,
+                mapped_host,
                 &binary_identity,
                 &denial.reason,
                 "transparent_tcp_destination_denied",
@@ -720,10 +822,27 @@ async fn preauthorize_transparent_open(
 
 fn emit_staged_transparent_denial(
     destination: SocketAddr,
+    mapped_host: Option<&str>,
     identity: &Result<ContractBinaryIdentity, ResolveError>,
     reason: &str,
     status_detail: &'static str,
 ) {
+    ocsf_emit!(build_staged_transparent_denial_event(
+        destination,
+        mapped_host,
+        identity,
+        reason,
+        status_detail,
+    ));
+}
+
+fn build_staged_transparent_denial_event(
+    destination: SocketAddr,
+    mapped_host: Option<&str>,
+    identity: &Result<ContractBinaryIdentity, ResolveError>,
+    reason: &str,
+    status_detail: &'static str,
+) -> openshell_ocsf::OcsfEvent {
     let (binary, ancestors, cmdline) = identity.as_ref().map_or_else(
         |_| ("-".to_string(), "-".to_string(), "-".to_string()),
         |identity| {
@@ -744,41 +863,99 @@ fn emit_staged_transparent_denial(
             )
         },
     );
-    ocsf_emit!(
-        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::Medium)
-            .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_ip(destination.ip(), destination.port()))
-            .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline))
-            .message(format!("Transparent TCP denied before relay: {reason}"))
-            .status_detail(status_detail)
-            .build()
-    );
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(transparent_destination_endpoint(destination, mapped_host))
+        .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline))
+        .message(format!("Transparent TCP denied before relay: {reason}"))
+        .status_detail(status_detail)
+        .build()
 }
 
-fn transparent_destination_host(
+/// Name the policy DNS host an operator recognizes while keeping the
+/// synthetic address the workload dialed.
+fn transparent_destination_endpoint(
+    destination: SocketAddr,
+    mapped_host: Option<&str>,
+) -> Endpoint {
+    let mut endpoint = Endpoint::from_ip(destination.ip(), destination.port());
+    endpoint.domain = mapped_host.map(str::to_string);
+    endpoint
+}
+
+/// Logical destination recovered for a staged transparent TCP open.
+struct TransparentTarget {
+    host: String,
+    /// Policy DNS correlation for a synthetic destination, read at the
+    /// generation current when the open arrived. `None` outside the pools.
+    intent: Option<MappingLookup>,
+}
+
+fn resolve_transparent_target(
     destination: SocketAddr,
     policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
     opa_engine: &OpaEngine,
-) -> Result<String> {
+) -> Result<TransparentTarget> {
     let Some(store) = policy_dns_store else {
-        return Ok(destination.ip().to_string());
+        return Ok(TransparentTarget {
+            host: destination.ip().to_string(),
+            intent: None,
+        });
     };
-    match store.lookup(
+    match store.lookup_intent(
         destination.ip(),
         destination.port(),
         opa_engine.current_generation(),
         std::time::Instant::now(),
     ) {
-        Ok(mapping) => Ok(mapping.record.normalized_name.as_str().to_string()),
-        Err(MappingLookupError::Missing) => Ok(destination.ip().to_string()),
+        Ok(mapping) => Ok(TransparentTarget {
+            host: mapping.record.normalized_name.as_str().to_string(),
+            intent: Some(mapping),
+        }),
+        Err(MappingLookupError::Missing) => Ok(TransparentTarget {
+            host: destination.ip().to_string(),
+            intent: None,
+        }),
         Err(error) => Err(miette::miette!(
             "transparent destination mapping is unavailable: {error}"
         )),
     }
+}
+
+/// Re-acquire a policy DNS mapping at the generation that produced
+/// `decision` and pin its addresses. Observation records, stale mappings, and
+/// unmapped ports fail closed.
+fn pinned_transparent_plan(
+    store: &ResolvedEndpointStore,
+    destination: SocketAddr,
+    decision: &EgressDecision,
+) -> std::result::Result<DestinationValidationPlan, MappingLookupError> {
+    let mapping = store.lookup(
+        destination.ip(),
+        destination.port(),
+        decision.policy_generation,
+        std::time::Instant::now(),
+    )?;
+    build_pinned_validation_plan(mapping.pinned_addresses())
+        .map_err(|_| MappingLookupError::InvalidMapping)
+}
+
+fn valid_policy_local_request(method: &str, target: &str, request_headers: &str) -> bool {
+    if method == "CONNECT" || !target.starts_with('/') {
+        return false;
+    }
+    let hosts = request_headers
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>();
+    matches!(hosts.as_slice(), [host] if host.eq_ignore_ascii_case(POLICY_LOCAL_HOST)
+        || host.eq_ignore_ascii_case("policy.local:80"))
 }
 
 impl Drop for ProxyHandle {
@@ -900,7 +1077,7 @@ async fn handle_transparent_tcp_connection(
     let workload_addr = client.peer_addr().into_diagnostic()?;
     let original = original_destination(&client).into_diagnostic()?;
     let current_generation = opa_engine.current_generation();
-    let mapping = match store.lookup(
+    let mapping = match store.lookup_intent(
         original.ip(),
         original.port(),
         current_generation,
@@ -908,7 +1085,7 @@ async fn handle_transparent_tcp_connection(
     ) {
         Ok(mapping) => mapping,
         Err(error) => {
-            emit_transparent_mapping_denial(workload_addr, original, error);
+            emit_transparent_mapping_denial(workload_addr, original, None, error);
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -944,6 +1121,17 @@ async fn handle_transparent_tcp_connection(
         return Ok(());
     }
 
+    if mapping.record.is_observation() {
+        emit_transparent_mapping_denial(
+            workload_addr,
+            original,
+            Some(&host),
+            MappingLookupError::EndpointMismatch,
+        );
+        emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+        return Ok(());
+    }
+
     // Authorization may race a policy reload. Re-pin the exact generation
     // that produced the decision, then reacquire the DNS mapping against that
     // generation before correlating endpoint identity or constructing a
@@ -952,7 +1140,12 @@ async fn handle_transparent_tcp_connection(
     let Ok(generation_guard) =
         relay::pin_policy_generation(&opa_engine, decision.policy_generation)
     else {
-        emit_transparent_mapping_denial(workload_addr, original, MappingLookupError::StalePolicy);
+        emit_transparent_mapping_denial(
+            workload_addr,
+            original,
+            Some(&host),
+            MappingLookupError::StalePolicy,
+        );
         emit_activity(&activity_tx, true, "transparent_tcp_mapping");
         return Ok(());
     };
@@ -964,7 +1157,7 @@ async fn handle_transparent_tcp_connection(
     ) {
         Ok(mapping) => mapping,
         Err(error) => {
-            emit_transparent_mapping_denial(workload_addr, original, error);
+            emit_transparent_mapping_denial(workload_addr, original, Some(&host), error);
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -1233,6 +1426,7 @@ fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
 fn emit_transparent_mapping_denial(
     workload: SocketAddr,
     original: SocketAddr,
+    mapped_host: Option<&str>,
     error: MappingLookupError,
 ) {
     let detail = match error {
@@ -1251,7 +1445,7 @@ fn emit_transparent_mapping_denial(
             .disposition(DispositionId::Blocked)
             .severity(SeverityId::Medium)
             .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_ip(original.ip(), original.port()))
+            .dst_endpoint(transparent_destination_endpoint(original, mapped_host))
             .src_endpoint_addr(workload.ip(), workload.port())
             .message(format!("Transparent TCP denied: {error}"))
             .status_detail(detail)
@@ -2221,20 +2415,30 @@ async fn handle_mediated_connection(
     let endpoint_observation_context = endpoint_observation_tx
         .as_ref()
         .and_then(EndpointObservationSender::capture);
+    let mut policy_local_transparent = false;
     let (mut preauthorized_decision, prevalidated_connector) = if let Some(transparent) =
         transparent_open
     {
         let destination = transparent.destination;
-        let host =
-            transparent_destination_host(destination, policy_dns_store.as_ref(), &opa_engine)?;
-        let (decision, connector) = transparent
-            .authorization
-            .map_or((None, None), |(decision, connector)| {
-                (Some(decision), Some(connector))
-            });
-        let authority = format!("{host}:{}", destination.port());
-        client = tokio::io::BufReader::new(virtual_connect_stream(client.into_inner(), authority));
-        (decision, connector)
+        if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS)
+            && destination.port() == 80
+        {
+            policy_local_transparent = true;
+            (None, None)
+        } else {
+            let host =
+                resolve_transparent_target(destination, policy_dns_store.as_ref(), &opa_engine)?
+                    .host;
+            let (decision, connector) = transparent
+                .authorization
+                .map_or((None, None), |(decision, connector)| {
+                    (Some(decision), Some(connector))
+                });
+            let authority = format!("{host}:{}", destination.port());
+            client =
+                tokio::io::BufReader::new(virtual_connect_stream(client.into_inner(), authority));
+            (decision, connector)
+        }
     } else {
         (None, None)
     };
@@ -2282,6 +2486,24 @@ async fn handle_mediated_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
+
+    if policy_local_transparent {
+        if !valid_policy_local_request(method, target, request) {
+            respond(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+            return Ok(());
+        }
+        let ctx = policy_local_ctx
+            .as_ref()
+            .ok_or_else(|| miette::miette!("sandbox-local policy context is unavailable"))?;
+        return crate::policy_local::handle_forward_request(
+            ctx,
+            method,
+            target,
+            &buf[..used],
+            &mut client,
+        )
+        .await;
+    }
 
     if method != "CONNECT" {
         return Box::pin(handle_forward_proxy(
@@ -6894,6 +7116,7 @@ process:
         )
         .unwrap();
         let identity_cache = BinaryIdentityCache::new();
+        let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
         let identity = || {
             Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
@@ -6927,9 +7150,18 @@ process:
 
         let (allowed, allowed_result) = pending("203.0.113.7:443");
         assert!(
-            preauthorize_transparent_open(allowed, None, &engine, &identity_cache, None, None)
-                .await
-                .is_some()
+            preauthorize_transparent_open(
+                allowed,
+                None,
+                &engine,
+                &identity_cache,
+                None,
+                None,
+                false,
+                Some(&denial_tx)
+            )
+            .await
+            .is_some()
         );
         assert_eq!(allowed_result.await.unwrap(), TcpOpenDecision::RelayReady);
 
@@ -6942,6 +7174,8 @@ process:
                 &identity_cache,
                 None,
                 None,
+                false,
+                Some(&denial_tx),
             )
             .await
             .is_none()
@@ -6950,17 +7184,507 @@ process:
             unsafe_result.await.unwrap(),
             TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination)
         );
+        assert!(
+            denial_rx.try_recv().is_err(),
+            "destination failures are not policy proposals"
+        );
 
         let (denied, denied_result) = pending("203.0.113.8:443");
         assert!(
-            preauthorize_transparent_open(denied, None, &engine, &identity_cache, None, None)
-                .await
-                .is_none()
+            preauthorize_transparent_open(
+                denied,
+                None,
+                &engine,
+                &identity_cache,
+                None,
+                None,
+                false,
+                Some(&denial_tx)
+            )
+            .await
+            .is_none()
         );
         assert_eq!(
             denied_result.await.unwrap(),
             TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
         );
+        let event = denial_rx
+            .try_recv()
+            .expect("policy denial is sent to mapper");
+        assert_eq!(event.host, "203.0.113.8");
+        assert_eq!(event.port, 443);
+        assert_eq!(event.binary, "/usr/bin/curl");
+        assert_eq!(event.denial_stage, "transparent_tcp_connect");
+        assert!(denial_rx.try_recv().is_err(), "exactly one mapper event");
+    }
+
+    const POLICY_DNS_OPEN_POLICY: &str = r"
+network_policies:
+  database:
+    name: database
+    endpoints:
+      - { host: db.example, port: 5432, protocol: tcp }
+    binaries: [{ path: /usr/bin/curl }]
+  pypi:
+    name: pypi
+    endpoints:
+      - { host: pypi.org, port: 80 }
+    binaries: [{ path: /usr/bin/curl }]
+filesystem_policy: { include_workdir: true, read_only: [], read_write: [] }
+landlock: { compatibility: best_effort }
+process: { run_as_user: sandbox, run_as_group: sandbox }
+";
+
+    /// Like the production pools, skip the reserved sandbox-local address.
+    fn policy_dns_test_store() -> Arc<ResolvedEndpointStore> {
+        Arc::new(ResolvedEndpointStore::new(
+            crate::policy_dns::StoreConfig::new(
+                crate::policy_dns::SyntheticPools::new(
+                    Ipv4Addr::new(198, 18, 0, 2)..=Ipv4Addr::new(198, 18, 0, 9),
+                    "fd00:1::1".parse::<Ipv6Addr>().unwrap()
+                        ..="fd00:1::8".parse::<Ipv6Addr>().unwrap(),
+                )
+                .unwrap(),
+                16,
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn publish_mapping(
+        store: &ResolvedEndpointStore,
+        name: &str,
+        policy_name: &str,
+        port: u16,
+        generation: u64,
+    ) -> crate::policy_dns::ResolvedEndpointRecord {
+        store
+            .publish(
+                crate::policy_dns::PublishRequest {
+                    normalized_name: crate::policy_dns::NormalizedName::parse(name).unwrap(),
+                    family: crate::policy_dns::AddressFamily::Ipv4,
+                    allocation_identity: [1; 32],
+                    policy_generation: generation,
+                    ttl: std::time::Duration::from_secs(30),
+                    contracts: vec![crate::policy_dns::ResolvedPortContract {
+                        endpoint_id: PolicyEndpointId {
+                            policy_name: policy_name.to_string(),
+                            endpoint_index: 0,
+                        },
+                        port,
+                        destination_plan: DestinationValidationPlan {
+                            address_authorization:
+                                destination::AddressAuthorization::ExactDeclaredHost,
+                        },
+                        pinned_addresses: vec!["203.0.113.8".parse().unwrap()],
+                    }],
+                },
+                generation,
+                std::time::Instant::now(),
+            )
+            .unwrap()
+    }
+
+    fn publish_observation(
+        store: &ResolvedEndpointStore,
+        name: &str,
+        generation: u64,
+    ) -> crate::policy_dns::ResolvedEndpointRecord {
+        store
+            .publish_observation(
+                crate::policy_dns::NormalizedName::parse(name).unwrap(),
+                crate::policy_dns::AddressFamily::Ipv4,
+                generation,
+                generation,
+                std::time::Instant::now(),
+            )
+            .unwrap()
+    }
+
+    fn staged_curl_open(
+        destination: SocketAddr,
+        generation: u64,
+    ) -> (
+        PendingTcpOpen,
+        tokio::sync::oneshot::Receiver<TcpOpenDecision>,
+    ) {
+        let (stream, _peer) = tokio::io::duplex(64);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        (
+            PendingTcpOpen {
+                stream: Box::new(stream),
+                binary_identity: Ok(ContractBinaryIdentity {
+                    executable: ContractExecutableIdentity {
+                        path: PathBuf::from("/usr/bin/curl"),
+                        digest: Some("00".repeat(32).parse().unwrap()),
+                    },
+                    ancestors: Vec::new(),
+                    cmdline_paths: Vec::new(),
+                }),
+                destination,
+                socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: 7,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+                policy_generation: generation,
+                timing: MediationTiming::default(),
+                decision,
+            },
+            completion,
+        )
+    }
+
+    #[tokio::test]
+    async fn staged_transparent_open_dials_only_pinned_policy_dns_addresses() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            POLICY_DNS_OPEN_POLICY,
+        )
+        .unwrap();
+        let store = policy_dns_test_store();
+        let record = publish_mapping(
+            &store,
+            "db.example",
+            "database",
+            5432,
+            engine.current_generation(),
+        );
+        let (open, completion) = staged_curl_open(
+            SocketAddr::new(record.synthetic_address, 5432),
+            engine.current_generation(),
+        );
+
+        let (_, _, _, transparent) = preauthorize_transparent_open(
+            open,
+            Some(&store),
+            &engine,
+            &BinaryIdentityCache::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("policy-backed mapping is admitted");
+
+        assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+        let (_, connector) = transparent
+            .and_then(|open| open.authorization)
+            .expect("transparent authorization");
+        assert_eq!(connector.addrs(), &["203.0.113.8:5432".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn staged_transparent_open_proposes_a_denied_observation_hostname() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            POLICY_DNS_OPEN_POLICY,
+        )
+        .unwrap();
+        let store = policy_dns_test_store();
+        let record = publish_observation(&store, "unknown.example", engine.current_generation());
+        let (open, completion) = staged_curl_open(
+            SocketAddr::new(record.synthetic_address, 443),
+            engine.current_generation(),
+        );
+        let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
+
+        assert!(
+            preauthorize_transparent_open(
+                open,
+                Some(&store),
+                &engine,
+                &BinaryIdentityCache::new(),
+                None,
+                None,
+                false,
+                Some(&denial_tx),
+            )
+            .await
+            .is_none()
+        );
+
+        assert_eq!(
+            completion.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
+        );
+        let event = denial_rx.try_recv().expect("denial is sent to the mapper");
+        assert_eq!(event.host, "unknown.example");
+        assert_eq!(event.port, 443);
+        assert_eq!(event.binary, "/usr/bin/curl");
+    }
+
+    #[tokio::test]
+    async fn staged_transparent_open_never_relays_an_observation_that_policy_allows() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            POLICY_DNS_OPEN_POLICY,
+        )
+        .unwrap();
+        let identity_cache = BinaryIdentityCache::new();
+        let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
+        let preauthorize = |store: Arc<ResolvedEndpointStore>, destination: SocketAddr| {
+            let (open, completion) = staged_curl_open(destination, engine.current_generation());
+            let engine = &engine;
+            let identity_cache = &identity_cache;
+            let denial_tx = &denial_tx;
+            async move {
+                let admitted = preauthorize_transparent_open(
+                    open,
+                    Some(&store),
+                    engine,
+                    identity_cache,
+                    None,
+                    None,
+                    false,
+                    Some(denial_tx),
+                )
+                .await
+                .is_some();
+                (admitted, completion.await.unwrap())
+            }
+        };
+
+        // The same policy admits curl to pypi.org:80 through a mapping with
+        // an endpoint contract.
+        let mapped_store = policy_dns_test_store();
+        let mapped = publish_mapping(
+            &mapped_store,
+            "pypi.org",
+            "pypi",
+            80,
+            engine.current_generation(),
+        );
+        assert_eq!(
+            preauthorize(mapped_store, SocketAddr::new(mapped.synthetic_address, 80)).await,
+            (true, TcpOpenDecision::RelayReady)
+        );
+
+        let observed_store = policy_dns_test_store();
+        let observed =
+            publish_observation(&observed_store, "pypi.org", engine.current_generation());
+        assert_eq!(
+            preauthorize(
+                observed_store,
+                SocketAddr::new(observed.synthetic_address, 80)
+            )
+            .await,
+            (
+                false,
+                TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination)
+            )
+        );
+        assert!(
+            denial_rx.try_recv().is_err(),
+            "an allowed intent is not a proposal"
+        );
+    }
+
+    #[test]
+    fn pinned_plan_requires_the_mapping_of_the_deciding_generation() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            POLICY_DNS_OPEN_POLICY,
+        )
+        .unwrap();
+        let store = policy_dns_test_store();
+        let mapped = publish_mapping(
+            &store,
+            "db.example",
+            "database",
+            5432,
+            engine.current_generation(),
+        );
+        let observed = publish_observation(&store, "pypi.org", engine.current_generation());
+        let (open, _) = staged_curl_open(
+            SocketAddr::new(mapped.synthetic_address, 5432),
+            engine.current_generation(),
+        );
+        let decide = |host: &str, port| {
+            authorize_supplied_identity(
+                &engine,
+                &BinaryIdentityCache::new(),
+                EgressIntent::connect(host.to_string(), port),
+                &open.binary_identity,
+            )
+        };
+        let mapped_destination = SocketAddr::new(mapped.synthetic_address, 5432);
+
+        pinned_transparent_plan(&store, mapped_destination, &decide("db.example", 5432))
+            .expect("the deciding generation pins its addresses");
+        assert!(matches!(
+            pinned_transparent_plan(
+                &store,
+                SocketAddr::new(observed.synthetic_address, 80),
+                &decide("pypi.org", 80),
+            ),
+            Err(MappingLookupError::PortMismatch)
+        ));
+
+        // A reload between DNS correlation and authorization yields a decision
+        // from a newer generation than the DNS answer. It must not fall back
+        // to resolving the name again.
+        engine
+            .reload(
+                include_str!("../data/sandbox-policy.rego"),
+                POLICY_DNS_OPEN_POLICY,
+            )
+            .unwrap();
+        let reloaded = decide("db.example", 5432);
+        assert!(matches!(reloaded.action, NetworkAction::Allow { .. }));
+        assert!(matches!(
+            pinned_transparent_plan(&store, mapped_destination, &reloaded),
+            Err(MappingLookupError::StalePolicy)
+        ));
+    }
+
+    #[test]
+    fn staged_denial_names_the_mapped_host_and_keeps_the_synthetic_address() {
+        let (open, _) = staged_curl_open("198.18.0.2:80".parse().unwrap(), 1);
+        let mapped = build_staged_transparent_denial_event(
+            open.destination,
+            Some("blocked.invalid"),
+            &open.binary_identity,
+            "endpoint blocked.invalid:80 is not allowed by any policy",
+            "transparent_tcp_policy_denied",
+        );
+        assert_eq!(
+            mapped.format_shorthand(),
+            "NET:OPEN [MED] DENIED /usr/bin/curl(0) -> blocked.invalid:80 [reason:transparent_tcp_policy_denied]"
+        );
+        assert_eq!(
+            serde_json::to_value(mapped).unwrap()["dst_endpoint"],
+            serde_json::json!({"domain": "blocked.invalid", "ip": "198.18.0.2", "port": 80})
+        );
+
+        let unmapped = build_staged_transparent_denial_event(
+            "203.0.113.7:443".parse().unwrap(),
+            None,
+            &open.binary_identity,
+            "endpoint 203.0.113.7:443 is not allowed by any policy",
+            "transparent_tcp_policy_denied",
+        );
+        assert_eq!(
+            serde_json::to_value(unmapped).unwrap()["dst_endpoint"],
+            serde_json::json!({"ip": "203.0.113.7", "port": 443})
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_policy_local_open_reaches_the_sandbox_scoped_api() {
+        let engine = Arc::new(
+            OpaEngine::from_strings(
+                include_str!("../data/sandbox-policy.rego"),
+                "network_policies: {}\n",
+            )
+            .unwrap(),
+        );
+        let cache = Arc::new(BinaryIdentityCache::new());
+        let identity = ContractBinaryIdentity {
+            executable: ContractExecutableIdentity {
+                path: PathBuf::from("/usr/bin/bash"),
+                digest: Some("44".repeat(32).parse().unwrap()),
+            },
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        };
+        let (stream, mut workload) = tokio::io::duplex(4096);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let pending = PendingTcpOpen {
+            stream: Box::new(stream),
+            binary_identity: Ok(identity.clone()),
+            destination: SocketAddr::from((crate::policy_dns::POLICY_LOCAL_ADDRESS, 80)),
+            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
+                socket_cookie: 7,
+                nonblocking: false,
+                process_generation: 1,
+            },
+            policy_generation: engine.current_generation(),
+            timing: MediationTiming::default(),
+            decision,
+        };
+        let (stream, supplied_identity, socket_addrs, transparent) =
+            preauthorize_transparent_open(pending, None, &engine, &cache, None, None, true, None)
+                .await
+                .expect("sandbox-local open is admitted");
+        assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+
+        let proposals = AgentProposals::new(true);
+        let (_workspace_tx, workspace_rx) = tokio::sync::watch::channel("default".to_string());
+        let context = Arc::new(PolicyLocalContext::new(
+            Some(openshell_core::proto::SandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            Some("test-sandbox".to_string()),
+            proposals.clone(),
+            workspace_rx,
+        ));
+        let handler = tokio::spawn(handle_mediated_connection(
+            tokio::io::BufReader::new(stream),
+            supplied_identity,
+            socket_addrs,
+            transparent,
+            None,
+            engine,
+            cache,
+            Arc::new(AtomicU32::new(0)),
+            None,
+            Some(context),
+            proposals,
+            Arc::new(None),
+            Arc::new(None),
+            Arc::new(None),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        workload
+            .write_all(b"GET /v1/policy/current HTTP/1.1\r\nHost: policy.local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            workload.read_to_end(&mut response),
+        )
+        .await
+        .expect("policy.local response timed out")
+        .unwrap();
+        handler.await.unwrap().unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert!(response.contains("\"format\":\"yaml\""), "{response}");
+    }
+
+    #[test]
+    fn policy_local_route_requires_one_exact_host_and_an_origin_form_target() {
+        assert!(valid_policy_local_request(
+            "GET",
+            "/v1/policy/current",
+            "GET /v1/policy/current HTTP/1.1\r\nHost: policy.local:80\r\n"
+        ));
+        for (method, target, headers) in [
+            ("CONNECT", "/v1/policy/current", "Host: policy.local\r\n"),
+            (
+                "GET",
+                "http://policy.local/v1/policy/current",
+                "Host: policy.local\r\n",
+            ),
+            ("GET", "/v1/policy/current", "Host: external.example\r\n"),
+            (
+                "GET",
+                "/v1/policy/current",
+                "Host: policy.local\r\nHost: external.example\r\n",
+            ),
+        ] {
+            assert!(!valid_policy_local_request(method, target, headers));
+        }
     }
 
     #[tokio::test]
@@ -7056,6 +7780,8 @@ process:
             &engine,
             &BinaryIdentityCache::new(),
             None,
+            None,
+            false,
             None,
         )
         .await
@@ -7311,6 +8037,8 @@ process:
             &BinaryIdentityCache::new(),
             None,
             None,
+            false,
+            None,
         )
         .await
         .expect("allowed binary reaches the synthetic IPv6 destination");
@@ -7338,6 +8066,8 @@ process:
                 &engine,
                 &BinaryIdentityCache::new(),
                 None,
+                None,
+                false,
                 None,
             )
             .await
@@ -7431,9 +8161,18 @@ process:
         };
 
         assert!(
-            preauthorize_transparent_open(pending, None, &engine, &identity_cache, None, None)
-                .await
-                .is_none()
+            preauthorize_transparent_open(
+                pending,
+                None,
+                &engine,
+                &identity_cache,
+                None,
+                None,
+                false,
+                None
+            )
+            .await
+            .is_none()
         );
         assert_eq!(
             completion.await.unwrap(),
@@ -7503,9 +8242,18 @@ process:
         };
 
         assert!(
-            preauthorize_transparent_open(pending, None, &engine, &identity_cache, None, None)
-                .await
-                .is_none()
+            preauthorize_transparent_open(
+                pending,
+                None,
+                &engine,
+                &identity_cache,
+                None,
+                None,
+                false,
+                None
+            )
+            .await
+            .is_none()
         );
         assert_eq!(
             completion.await.unwrap(),

@@ -272,7 +272,7 @@ IDs fail instead of creating source precedence. The gateway treats configured
 interceptors as trusted sources and does not verify signature annotations in
 their profile payloads.
 
-The CLI exposes reusable profile definitions through `openshell profile`, with `list` and `describe` reading the same effective catalog used by provider creation. Export, import, update, lint, and delete share that top-level command group. Workspace selection and explicit platform scope apply at the existing profile API boundary; `openshell provider` manages credential-bearing instances.
+The CLI exposes reusable profile definitions through `openshell profile`, with `list` and `describe` reading the same effective catalog used by provider creation. Export, import, update, lint, and delete share that top-level command group. Import and lint accept local files, local directories, or a single HTTP or HTTPS URL; the CLI fetches and parses remote content before submitting it to the gateway. Workspace selection and explicit platform scope apply at the existing profile API boundary; `openshell provider` manages credential-bearing instances.
 
 Each logical gateway request captures the selected sources into one validated,
 immutable effective catalog before deriving provider behavior. Policy layers,
@@ -361,7 +361,8 @@ successor removes that retry path across every gateway replica. Short
 that has not yet been refreshed. Omitting `gateway_jwt.ttl_secs` selects
 non-expiring launch-scoped gateway and Sandbox Protocol tokens for local
 single-player Docker, Podman, and VM gateways; both token profiles carry
-`exp = 0`. Typed extension JWTs retain a 900-second default when the field is
+`exp = 0`, and supervisors skip periodic renewal of those session tokens.
+Typed extension JWTs retain a 900-second default when the field is
 omitted. Kubernetes and other shared deployments should set a positive TTL.
 Explicit zero is rejected.
 
@@ -1097,6 +1098,11 @@ stdout is redirected to a file), so the exec is never ended on output-idle
 alone — instead an unanswered keepalive on a wedged or orphaned relay closes the
 channel and returns the exec with an error. Once a command reports its exit
 status, the gateway also bounds how long it waits for the trailing channel close.
+An exec relay reports success only after receiving both the SSH exit status and
+channel close; a missing close is a transport error even when the exit status is zero.
+The supervisor derives that SSH exit status from the boundary output stream's
+terminal frame after draining stdout and stderr, so an output delivery failure
+cannot be masked by a successful process wait.
 
 Interactive exec treats normal request-stream EOF as the end of stdin and resize
 input. The gateway sends SSH EOF while keeping the output channel open until
@@ -1105,6 +1111,11 @@ as normal EOF. The input and output pumps are owned by the exec operation, so
 timeout or response abandonment cannot leave a detached stdin task behind.
 The pumps share polling fairly, and request processing yields cooperatively even
 for ignored resize messages, so sustained input cannot monopolize the operation.
+The CLI keeps piped input in the unary request when the complete encoded
+request fits the gateway's decoder limit, preserving compatibility with older
+gateways. Input up to the CLI's 4 MiB cap uses this stream with bounded frames
+when the unary message would exceed the decoder limit, with or without a PTY.
+The CLI closes the input side at pipe EOF.
 
 Go and TypeScript interactive-exec helpers distinguish process exit from stream
 completion. They consume the final gRPC status before reporting success and retain
@@ -1206,7 +1217,7 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
 Driver implementation settings live exclusively in TOML driver tables. The
 selector is the singular `[openshell.gateway] compute_driver`; legacy
-`compute_drivers` lists are rejected. See `docs/reference/gateway-config.mdx`
+`compute_drivers` lists are rejected. See `docs/how-it-works/gateways/configuration.mdx`
 for worked per-driver examples and RFC 0003 for the full schema.
 
 Each installation has an operator-assigned gateway name. Configure it with

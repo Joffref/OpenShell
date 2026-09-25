@@ -140,6 +140,16 @@ While an exec handle is retained, independent waits return its stable exit or
 signal status, whether or not an output attachment is open or the main process
 has exited. Waiting never holds the exec registry lock, so other operations can
 still signal or attach to the process.
+Exec output uses a bounded queue that backpressures the process reader until its
+attachment consumes the bytes. An attached reader can apply backpressure
+without losing bytes; an absent reader that leaves the queue full eventually
+fails the exec and terminates its process. The final stream status carries
+delivery failures separately from the process handle's stable wait result.
+After the exec parent exits, output drains until its pipes close. If a
+descendant keeps a pipe open beyond 30 seconds, the exec reports an output
+delivery failure and drains later writes without retaining them. This avoids
+guessing which bytes belong to the parent.
+Canonical main-process output retains its bounded replay log.
 
 ## Isolation Layers
 
@@ -259,8 +269,9 @@ Input mediation, DNS/TCP authorization, and outer-fence enforcement are
 identical in both modes. The selected mode is emitted in the sandbox
 qualification output (`seccomp_listener_mode`).
 
-DNS uses an exact sandbox-local resolver at `127.0.0.53:53`. The driver sets the
-nameserver and permits an unprivileged bind to port 53. UDP and TCP DNS requests
+DNS uses an exact sandbox-local resolver at `127.0.0.53:53`. The driver sets that
+nameserver without search domains, so names reach policy DNS as the workload
+wrote them, and permits an unprivileged bind to port 53. UDP and TCP DNS requests
 are forwarded through the supervisor, which applies hostname-based DNS policy.
 The Podman driver supplies that resolver configuration as a driver-owned,
 read-only secret mounted at `/etc/resolv.conf`; the workload remains on
@@ -335,13 +346,25 @@ preserves this lifetime rule; persistent responses remain eligible for reuse.
 An explicit `protocol: tcp` endpoint with a valid DNS hostname opts into native
 DNS and transparent TCP when the selected runtime advertises that substrate.
 Hostless `allowed_ips` and literal-IP selectors remain available only to the
-legacy explicit-proxy path when `protocol` is omitted. The shared supervisor
-answers only eligible DNS names, returns an epoch-scoped synthetic address, and
+legacy explicit-proxy path when `protocol` is omitted. For an eligible DNS
+name, the shared supervisor returns an epoch-scoped synthetic address and
 publishes the expiring name, endpoint, ports, policy generation, and validated
-real addresses as one correlation. A connection to that synthetic address is
+real addresses as one correlation. A name absent from policy receives at most a
+contract-free observation address for policy advisor proposals; see
+[Security Policy](security-policy.md). A connection to that synthetic address is
 captured before the bypass fence, mapped back to its workload process, authorized
 through the same egress pipeline, and dialed only through the pinned addresses.
 Omitted protocol endpoints retain explicit-proxy behavior.
+
+Policy DNS reserves `policy.local` inside each sandbox without requiring an
+authored network endpoint or a trusted external lookup. The source-backed TCP
+boundary routes plain HTTP on the reserved address and port 80 to the
+supervisor's sandbox-local policy API; it does not open an upstream connection.
+The API checks the effective agent proposal setting for every request. Policy
+denials at the staged TCP authorization gate enter the supervisor's denial
+aggregator with the resolved binary and destination, so the mechanistic mapper
+can propose a scoped rule. Invalid mappings and destination validation failures
+do not become policy proposals.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static

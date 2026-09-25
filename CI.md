@@ -40,6 +40,21 @@ The GitHub ruleset should require the `OpenShell / ...` statuses published by
 `Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
 push-triggered workflow jobs themselves.
 
+### Run only the policy advisor conformance tests
+
+Manually dispatch `Integration Tests` on the candidate branch with an
+`artifact-run-id` from a build of the same commit. Set `category` to
+`policy-advisor` and `test-matrix` to:
+
+```json
+[{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
+```
+
+This runs the `mechanistic-proposal`, `new-hostname-proposal`, and
+`policy-local` conformance tests in the installed-artifact suite. The artifact run must contain the candidate CLI and
+gateway binaries and runtime images. This manual run does not replace the
+required PR E2E gate.
+
 ## Informational security reports
 
 Security workflow compute runs directly on GitHub-hosted runners instead of
@@ -103,10 +118,13 @@ Actions or call it from another workflow. All applicable children analyze the
 candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
 
-Tagged releases treat CodeQL, Trivy, Zizmor, Cargo Deny, and Codex Security
-findings as failures of the currently implemented qualification profile. A
-profile failure does not prevent a pre-release candidate's complete artifact
-set from being published, but it does prevent stable publication.
+Tagged releases treat Cargo Deny and Codex Security findings as failures of the
+currently implemented qualification profile. A profile failure does not prevent
+a pre-release candidate's complete artifact set from being published, but it
+does prevent stable publication. CodeQL, Trivy, and Zizmor findings are
+temporarily informational for tagged releases: the existing findings were
+reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
+Scanner failures still fail qualification.
 
 ```shell
 gh workflow run security-scan.yml --ref main \

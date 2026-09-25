@@ -1448,6 +1448,9 @@ mod linux {
 
     impl MainAttachment {
         fn exit_status(&self, fallback_code: i32) -> ExitStatusWire {
+            if self.session.output_failed() {
+                return ExitStatusWire::Exited(74);
+            }
             match &self.status {
                 AttachmentStatus::Main(process) => process
                     .exit_status()
@@ -2076,6 +2079,7 @@ mod linux {
                 stdout,
                 stderr,
                 terminal,
+                output_status: _,
             } = session;
             let Some(stdin) = stdin else {
                 return Err(guest_error(
@@ -3002,15 +3006,14 @@ mod linux {
             while let Some((channel, payload)) = read_stream_frame(&mut reader).await? {
                 match channel {
                     STREAM_STDIN => {
-                        let Some(input) = input.as_ref() else {
-                            return Err(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "main process stdin already closed",
-                            ));
-                        };
-                        input.send(payload).await.map_err(|_| {
-                            io::Error::new(io::ErrorKind::BrokenPipe, "main process stdin closed")
-                        })?;
+                        // A process may close stdin before the client has
+                        // finished sending it. Keep relaying stdout, stderr,
+                        // and the final status after that write fails.
+                        if let Some(sender) = input.as_ref()
+                            && sender.send(payload).await.is_err()
+                        {
+                            input.take();
+                        }
                     }
                     // Keep reading after stdin closes so transport EOF still
                     // releases this control process's attachment lease.
@@ -3052,6 +3055,21 @@ mod linux {
                         .map_err(|error| format!("write main process exit: {error}"));
                 }
                 Err(error) => {
+                    if matches!(&attachment.status, AttachmentStatus::Exec(_)) {
+                        tracing::warn!(
+                            skipped_chunks = error.skipped,
+                            "exec output could not be delivered intact"
+                        );
+                        let message = b"openshell: exec output could not be delivered intact\n";
+                        let _ =
+                            write_stream_frame(&mut *writer.lock().await, STREAM_STDERR, message)
+                                .await;
+                        let status = serde_json::to_vec(&ExitStatusWire::Exited(74))
+                            .map_err(|error| format!("encode exec output failure: {error}"))?;
+                        break write_stream_frame(&mut *writer.lock().await, STREAM_EXIT, &status)
+                            .await
+                            .map_err(|error| format!("write exec output failure: {error}"));
+                    }
                     tracing::warn!(
                         skipped_chunks = error.skipped,
                         "main process attachment resumed after dropping retained output"

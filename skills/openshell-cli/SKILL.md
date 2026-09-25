@@ -34,12 +34,12 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 
 Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published documentation for product concepts and supported workflows:
 
-- [Manage gateways](https://docs.nvidia.com/openshell/latest/sandboxes/manage-gateways.md)
-- [Manage sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes.md)
-- [Manage providers](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
-- [Profiles](https://docs.nvidia.com/openshell/latest/providers/profiles.md)
-- [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
-- [Inference routing](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md)
+- [Manage gateways](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/overview)
+- [Manage sandboxes](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview)
+- [Manage providers](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview)
+- [Profiles](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles)
+- [Sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
+- [Inference routing](https://docs.nvidia.com/openshell/latest/how-it-works/inference)
 
 ---
 
@@ -82,10 +82,13 @@ attaches your terminal to that retained process. Add `--detach` to return after
 the sandbox becomes ready without attaching.
 
 An explicit trailing command is foreground even when stdin or stdout is not a
-terminal. The CLI streams its stdout and stderr and returns its exact exit
-status. Exit code 0 leaves a retained sandbox in `Completed`; nonzero leaves it
-in `Error` with `MainProcessFailed`. Use `--no-keep` to delete either result
-after output drains, or `--detach` for a long-running service. Combine
+terminal. The CLI streams its stdout and stderr and reports the command's exit
+status after output drains. A failure to deliver output makes the CLI report a
+failure even if the command itself exited successfully; check the sandbox's
+state before retrying work that might have side effects. Exit code 0 leaves a
+retained sandbox in `Completed`; nonzero leaves it in `Error` with
+`MainProcessFailed`. Use `--no-keep` to delete either result after output
+drains, or `--detach` for a long-running service. Combine
 `--detach --no-keep` when the gateway should run the service without a host
 attachment and delete its sandbox after the service exits.
 
@@ -165,7 +168,13 @@ openshell profile describe github
 openshell profile export github --output yaml
 openshell profile lint --file ./my-profile.yaml
 openshell profile import --file ./my-profile.yaml
+openshell profile lint --url https://example.com/profiles/my-profile.yaml
+openshell profile import --url https://example.com/profiles/my-profile.yaml
 ```
+
+`--url` accepts one HTTP or HTTPS YAML or JSON profile. Review its endpoint and
+binary grants before importing it. The URL path must end in `.yaml`, `.yml`, or
+`.json`; downloads are limited to 1 MiB and 15 seconds.
 
 Use `profile describe` to inspect a definition's credential metadata, endpoints, TLS handling, MCP access settings, rule counts, binaries, source, and scope before creating a provider. Check for `tls: skip` and the uninspected-credential opt-in before relying on displayed L7 rules. List and describe accept table, JSON, and YAML output; use structured output for complete rule definitions, `--workspace` for a workspace catalog, or `--global` for platform scope. Use `profile export` when preparing an editable definition, `profile update <id> --file <file>` to replace an existing custom profile with its current resource version, and `profile delete <id>...` to remove custom profiles. Provider instances remain under `provider`.
 
@@ -399,9 +408,13 @@ openshell sandbox exec --name my-sandbox --workdir /workspace -- ls -la
 openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
 
-`sandbox exec` starts an independent sibling process, streams output, and exits
-with the remote command's exit code. Use `sandbox connect` to attach to the
-canonical main process.
+`sandbox exec` starts an independent sibling process and streams output. After
+stdout and stderr drain, it returns the remote command's exit code if delivery
+succeeds. Output delivery failure instead returns exit code 74, even when the
+command exited successfully. A descendant that keeps an inherited output pipe
+open for more than 30 seconds after the command exits triggers that failure.
+Check whether the command ran before retrying work with side effects. Use
+`sandbox connect` to attach to the canonical main process.
 Use `--env` only for non-secret values. Attach credentials to the sandbox with a
 provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 
@@ -485,7 +498,7 @@ first failed load reset that window; repeated failures do not. After
 `ProvisioningTimedOut`, inspect the retained record and cleanup status, repair
 configuration, and explicitly run `sandbox start` once cleanup completes. A CLI
 wait timeout is separate from this gateway deadline. Follow the
-published [policy repair guidance](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
+published [policy repair guidance](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
 and confirm current replacement/detach syntax with installed CLI help.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
@@ -532,7 +545,7 @@ In a separate terminal or as the agent:
 openshell logs dev --tail --source sandbox
 ```
 
-Look for log lines with `action: deny` -- these indicate blocked network requests. The logs include:
+Look for `DENIED` log lines. `NET:OPEN [MED] DENIED` marks a blocked connection, and `HTTP:<METHOD> [MED] DENIED` marks a blocked request. Policy events are INFO-level log records, so do not add `--level warn`. The logs include:
 
 - **Destination host and port** (what was blocked)
 - **Binary path** (which process attempted the connection)
@@ -541,17 +554,18 @@ Look for log lines with `action: deny` -- these indicate blocked network request
 ### Step 3: Pull the current policy
 
 ```bash
-openshell policy get dev --full > current-policy.yaml
+set -o pipefail
+openshell policy get dev --base | sed '1,/^---$/d' > current-policy.yaml
 ```
 
-The `--full` flag includes the effective policy, including provider-composed entries. Use `--base` instead when the editable base policy is needed without provider-composed entries. Before resubmitting a `--full` result, review composed entries and prefer incremental updates or the base policy when appropriate.
+`--base` returns the editable policy without provider-composed entries; OpenShell composes attached provider rules separately. The command prints revision details, a `---` line, and then the policy YAML. The `sed` expression keeps only the YAML, because `policy set` cannot parse the revision details. Use `--full` only to inspect the effective policy, not as input to `policy set`.
 
 ### Step 4: Modify the policy
 
 Edit `current-policy.yaml` to allow the blocked actions. **For policy content authoring, delegate to the `generate-sandbox-policy` skill.** That skill handles:
 
 - Network endpoint rule structure
-- L4 vs REST, WebSocket, JSON-RPC, MCP, and SQL L7 policy decisions
+- L4 vs REST, WebSocket, JSON-RPC, and MCP L7 policy decisions
 - Access presets (`read-only`, `read-write`, `full`)
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
@@ -728,7 +742,7 @@ openshell sandbox connect work-session --editor vscode
 Monitor denied activity:
 
 ```bash
-openshell logs work-session --tail --source sandbox --level warn
+openshell logs work-session --tail --source sandbox
 ```
 
 When denied actions appear:
@@ -747,9 +761,11 @@ When denied actions appear:
    one.
 
    `--add-allow` and `--add-deny` require `--rule-name` and the complete binary scope through repeated `--binary` or explicit `--any-binary`. Declare every port on the endpoint in the operation, for example `api.example.com:443,8443:POST:/admin`. Use `--endpoint-path` to disambiguate endpoints within the selected rule; an explicitly empty path selects an endpoint without a path selector. The gateway rejects missing or mismatched scope before persistence. Inspect the current policy and confirm the intended affected scope; do not automatically fill declarations from current policy just to make a rejection pass.
-2. Use full YAML replacement for broad changes or non-network fields, including
-   any change that would otherwise require restating a large existing scope:
-   `openshell policy get work-session --full > policy.yaml`
+2. Use full YAML replacement for broad network changes or settings that
+   `policy update` cannot express, including any change that would otherwise
+   require restating a large existing scope. Filesystem, Landlock, and process
+   changes still require recreating the sandbox:
+   `openshell policy get work-session --base | sed '1,/^---$/d' > policy.yaml`
    Modify the policy with the `generate-sandbox-policy` skill.
    `openshell policy set work-session --policy policy.yaml --wait`
 3. Verify with `openshell policy list work-session`.
